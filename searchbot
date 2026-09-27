@@ -1,0 +1,225 @@
+
+import csv
+import html
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from getpass import getpass
+from urllib.parse import urlparse, urlsplit, urlunsplit
+
+import requests
+
+API_URL = "https://google.serper.dev/search"
+
+SOCIAL_DOMAINS = {
+    "reddit.com": "Reddit",
+    "github.com": "GitHub",
+    "x.com": "X",
+    "twitter.com": "X/Twitter",
+    "instagram.com": "Instagram",
+    "facebook.com": "Facebook",
+    "linkedin.com": "LinkedIn",
+    "youtube.com": "YouTube",
+    "tiktok.com": "TikTok",
+}
+
+def normalize_url(url: str) -> str:
+    try:
+        parts = urlsplit(url.strip())
+        host = parts.netloc.lower().removeprefix("www.")
+        path = parts.path.rstrip("/") or "/"
+        return urlunsplit((parts.scheme.lower() or "https", host, path, "", ""))
+    except Exception:
+        return url.strip()
+
+def domain_label(url: str) -> str:
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    for domain, label in SOCIAL_DOMAINS.items():
+        if host == domain or host.endswith("." + domain):
+            return label
+    return host or "Other"
+
+def build_queries(term: str):
+    term = term.strip()
+    exact = f'"{term}"'
+    queries = [
+        exact,
+        f'{exact} profile',
+        f'{exact} account',
+        f'site:reddit.com {exact}',
+        f'site:github.com {exact}',
+        f'site:x.com {exact}',
+        f'site:instagram.com {exact}',
+        f'site:facebook.com {exact}',
+        f'site:linkedin.com {exact}',
+    ]
+
+    if "@" in term and "." in term:
+        local = term.split("@", 1)[0]
+        if local:
+            qlocal = f'"{local}"'
+            queries += [
+                qlocal,
+                f'{qlocal} profile',
+                f'site:reddit.com {qlocal}',
+                f'site:github.com {qlocal}',
+                f'site:x.com {qlocal}',
+                f'site:instagram.com {qlocal}',
+            ]
+
+    # preserve order while removing duplicates
+    return list(dict.fromkeys(queries))
+
+def search_serper(api_key: str, query: str, num: int = 10):
+    headers = {
+        "X-API-KEY": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {"q": query, "num": num, "gl": "us", "hl": "en"}
+    r = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+    if r.status_code == 401:
+        raise RuntimeError("API key rejected (401). Check your Serper API key.")
+    if r.status_code == 429:
+        raise RuntimeError("Rate limit reached (429). Try again later.")
+    r.raise_for_status()
+    data = r.json()
+    return data.get("organic", [])
+
+def relevance(term: str, title: str, url: str, snippet: str) -> int:
+    needle = term.lower().strip()
+    text = " ".join([title, url, snippet]).lower()
+    score = 0
+    if needle and needle in text:
+        score += 3
+    if "@" in needle:
+        local = needle.split("@", 1)[0]
+        if local and local in text:
+            score += 1
+    if any(d in url.lower() for d in SOCIAL_DOMAINS):
+        score += 1
+    return score
+
+def collect(api_key: str, term: str):
+    rows = []
+    seen = set()
+    queries = build_queries(term)
+
+    print(f"\nRunning {len(queries)} public-web searches for: {term}\n")
+    for i, query in enumerate(queries, 1):
+        print(f"[{i}/{len(queries)}] {query}")
+        try:
+            results = search_serper(api_key, query)
+        except Exception as exc:
+            print(f"  Search failed: {exc}")
+            continue
+
+        for item in results:
+            url = item.get("link", "").strip()
+            if not url:
+                continue
+            key = normalize_url(url)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            title = item.get("title", "").strip()
+            snippet = item.get("snippet", "").strip()
+            rows.append({
+                "score": relevance(term, title, url, snippet),
+                "source": domain_label(url),
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "found_by_query": query,
+            })
+        time.sleep(0.15)
+
+    rows.sort(key=lambda x: (-x["score"], x["source"].lower(), x["title"].lower()))
+    return rows
+
+def save_csv(rows, path):
+    fields = ["score", "source", "title", "url", "snippet", "found_by_query"]
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+
+def save_html(rows, term, path):
+    body = []
+    for r in rows:
+        body.append(
+            "<tr>"
+            f"<td>{r['score']}</td>"
+            f"<td>{html.escape(r['source'])}</td>"
+            f"<td>{html.escape(r['title'])}</td>"
+            f"<td><a href=\"{html.escape(r['url'], quote=True)}\">open</a></td>"
+            f"<td>{html.escape(r['snippet'])}</td>"
+            f"<td>{html.escape(r['found_by_query'])}</td>"
+            "</tr>"
+        )
+
+    page = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Search report</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 24px; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border: 1px solid #ccc; padding: 8px; vertical-align: top; }}
+th {{ position: sticky; top: 0; background: #f5f5f5; }}
+</style>
+</head>
+<body>
+<h1>Public Web Search Report</h1>
+<p><strong>Search term:</strong> {html.escape(term)}</p>
+<p><strong>Generated:</strong> {html.escape(datetime.now().isoformat(timespec="seconds"))}</p>
+<p>Scores indicate text relevance only. They do not prove that two accounts belong to the same person.</p>
+<table>
+<thead>
+<tr><th>Score</th><th>Source</th><th>Title</th><th>Link</th><th>Snippet</th><th>Query</th></tr>
+</thead>
+<tbody>
+{''.join(body)}
+</tbody>
+</table>
+</body>
+</html>"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(page)
+
+def main():
+    print("PUBLIC WEB SEARCH BOT")
+    print("---------------------")
+    term = input("Name, username, email, or keyword to search: ").strip()
+    if not term:
+        sys.exit("Nothing entered.")
+
+    api_key = os.getenv("SERPER_API_KEY") or getpass("Serper API key (hidden): ").strip()
+    if not api_key:
+        sys.exit("No API key entered.")
+
+    rows = collect(api_key, term)
+    print(f"\nFound {len(rows)} unique results.")
+
+    for r in rows[:20]:
+        print(f"\n[{r['score']}] {r['source']} | {r['title']}")
+        print(r["url"])
+        if r["snippet"]:
+            print(r["snippet"][:240])
+
+    if rows:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", term)[:40].strip("_") or "search"
+        csv_path = f"{safe}_{stamp}.csv"
+        html_path = f"{safe}_{stamp}.html"
+        save_csv(rows, csv_path)
+        save_html(rows, term, html_path)
+        print(f"\nSaved: {csv_path}")
+        print(f"Saved: {html_path}")
+
+if __name__ == "__main__":
+    main()
